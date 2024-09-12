@@ -8,8 +8,8 @@ SEQ_LEN=2048
 BS=256
 
 # Experiment details
-EXP_NAME=TODO
-EXP_DIR=TODO
+EXP_NAME=quadratic_125
+EXP_DIR=quad_exp
 
 sudo mkdir -p /${EXP_DIR}/${EXP_NAME} && sudo chmod -R 777 ${EXP_DIR}/${EXP_NAME};
 cd ../..
