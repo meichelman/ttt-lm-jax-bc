@@ -504,6 +504,166 @@ class TTTLinear(TTTLinearBase):
         return output
 
 
+class TTTQuadraticBase(TTTBase):
+    def setup(self):
+        super().setup()
+        self.W1 = self.param(
+            "ttt_dense_0",
+            nn.initializers.normal(self.config.initializer_range),
+            (self.num_heads, self.head_dim, self.head_dim),
+            self.param_dtype,
+        )
+        self.W2 = self.param(
+            "ttt_dense_1",
+            nn.initializers.normal(self.config.initializer_range),
+            (self.num_heads, self.head_dim, self.head_dim),
+            self.param_dtype,
+        )
+        self.b1 = self.param("ttt_bias_0", nn.initializers.zeros, (self.num_heads, 1, self.head_dim), self.param_dtype)
+        self.ttt_params = (self.W2, self.W1, self.b1)
+
+    def process_mini_batch(
+        self,
+        XQ_mini_batch,
+        XK_mini_batch,
+        XV_mini_batch,
+        eta_mini_batch,
+        ttt_params_init,
+        ttt_params_mini_batch_init,
+        ttt_norm_params,
+    ):
+
+        W2_init, W1_init, b1_init = ttt_params_mini_batch_init
+        square_eta_mini_batch = eta_mini_batch[: self.mini_batch_size]
+        last_eta_in_mini_batch = eta_mini_batch[-1][:, None]
+
+        X1 = XK_mini_batch
+        Z1 = (X1 ** 2) @ W2_init + X1 @ W1_init + b1_init
+        ttt_norm_out, ttt_norm_vjp = jax.vjp(lambda z: self.ttt_norm.apply({"params": ttt_norm_params}, z), Z1)
+        ssl_target = XV_mini_batch - XK_mini_batch
+        grad_l_wrt_ttt_norm_out = ttt_norm_out - ssl_target
+        grad_l_wrt_Z1 = ttt_norm_vjp(grad_l_wrt_ttt_norm_out)[0]
+
+        # Calculate TTT loss using W_init of the current mini-batch
+        if self.config.output_ttt_stats:
+            ttt_loss_mse_step_0 = (grad_l_wrt_ttt_norm_out[-1] ** 2).mean()
+        else:
+            ttt_loss_mse_step_0 = None
+
+        # Calculate TTT loss using W_init of the entire sequence
+        if self.config.output_ttt_stats:
+            W2_0, W1_0, b1_0 = ttt_params_init
+            Z1_0 = (X1 ** 2) @ W2_0 + X1 @ W1_0 + b1_0
+            ttt_norm_out_0 = self.ttt_norm.apply({"params": ttt_norm_params}, Z1_0)
+            ttt_loss_mse_init = ((ttt_norm_out_0 - ssl_target)[-1] ** 2).mean()
+        else:
+            ttt_loss_mse_init = None
+
+        X1_bar = XQ_mini_batch
+        Attn1 = jnp.tril(X1_bar @ X1.transpose(1, 0))
+        b1_bar = b1_init - (square_eta_mini_batch * jnp.tril(jnp.ones_like(Attn1))) @ grad_l_wrt_Z1
+        Z1_1_bar = X1_bar @ W1_init - (square_eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
+        Z1_2_bar = X2_bar @ W2_init - (square_eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + Z1_1_bar
+        Z1_bar = Z1_2_bar
+        ttt_norm_out_bar = self.ttt_norm.apply({"params": ttt_norm_params}, Z1_bar)
+
+        output_mini_batch = X1_bar + ttt_norm_out_bar
+
+        W2_bar_last = W2_init - (last_eta_in_mini_batch * X1).transpose(1, 0) @ grad_l_wrt_Z1
+        W1_bar_last = W1_init - (last_eta_in_mini_batch * X1).transpose(1, 0) @ grad_l_wrt_Z1
+        b1_bar_last = b1_init - jnp.sum(last_eta_in_mini_batch * grad_l_wrt_Z1, axis=0, keepdims=True)
+
+        # Calculate ttt loss using the updated W_init by the current mini-batch
+        if self.config.output_ttt_stats:
+            X1_last_fwd_new = (X1 ** 2)[-1:] @ W2_bar_last + X1[-1:] @ W1_bar_last + b1_bar_last
+            X1_last_fwd_new = self.ttt_norm.apply({"params": ttt_norm_params}, X1_last_fwd_new)
+            ttt_loss_mse_step_1 = ((X1_last_fwd_new - ssl_target[-1:]) ** 2).mean()
+        else:
+            ttt_loss_mse_step_1 = None
+
+        ttt_params_mini_batch_new = (W2_bar_last, W1_bar_last, b1_bar_last)
+
+        return (
+            ttt_params_mini_batch_new,
+            (output_mini_batch, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1),
+        )
+
+
+class TTTQuadratic(TTTQuadraticBase):
+    def setup(self):
+        super().setup()
+        self.wg = nn.Dense(
+            self.width,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+        )
+
+    def setup_qkvo(self):
+        self.wq = nn.Dense(
+            self.num_heads * self.head_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+        )
+        if self.config.remat_conv != "":
+            conv_module = nn_partitioning.remat(
+                nn.Conv, policy=get_gradient_checkpoint_policy(self.config.remat_conv), prevent_cse=True
+            )
+        else:
+            conv_module = nn.Conv
+        self.conv_q = conv_module(
+            self.config.hidden_size,
+            (self.config.conv_width,),
+            padding="CAUSAL",
+            feature_group_count=self.config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+        self.conv_k = conv_module(
+            self.config.hidden_size,
+            (self.config.conv_width,),
+            padding="CAUSAL",
+            feature_group_count=self.config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+        self.wv = nn.Dense(
+            self.num_heads * self.head_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+        )
+        self.wo = nn.Dense(
+            self.width,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+        )
+
+    def get_qkv_projections(self, batch):
+        xqk, XV = self.wq(batch), self.wv(batch)
+        XQ = self.conv_q(xqk)
+        XK = self.conv_k(xqk)
+        return XQ, XK, XV
+
+    def apply_gate(self, hidden_states, ttt_output):
+        y = self.wg(hidden_states)
+        y = nn.gelu(y)
+        output = y * ttt_output
+        return output
+
+
 class TTTMLPBase(TTTBase):
     def setup(self):
         super().setup()
